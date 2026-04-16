@@ -1,0 +1,10 @@
+{
+  "id": "discord-sharkord-bridge",
+  "name": "Discord-Sharkord Bridge",
+  "author": "0x6DD8",
+  "description": "Copy discord messages to sharkord!",
+  "homepage": "https://github.com/0x6DD8/discord-sharkord-bridge",
+  "logo": "https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/discord.svg",
+  "sdkVersion": 1,
+  "version": "0.0.1"
+}
