@@ -1,129 +1,45 @@
 import {
+  ChannelType,
   type PluginContext,
+  type UnloadPluginContext,
 } from "@sharkord/plugin-sdk";
 import {
-  ChannelType,
+  ChannelType as DiscordChannelType,
   Client,
   GatewayIntentBits,
   type TextChannel,
   type Webhook,
 } from "discord.js";
+import type { TBridgeStatus, TPlugin } from "../types";
 
-let discordClient: Client | null = null;
-const webhookByChannelId = new Map<string, Webhook>();
-const sharkordChannelIdByName = new Map<string, number>();
-
-const CHANNEL_SCAN_MAX_ID = 500;
-const CHANNEL_SCAN_BATCH_SIZE = 25;
-
-let channelScanPromise: Promise<void> | null = null;
-
-type SharkordFile = {
+type SharkordAvatar = {
   name: string;
   _accessToken?: string;
   _accessTokenExpiresAt?: number;
 };
 
-type SharkordUser = {
-  name: string;
-  avatar?: SharkordFile | null;
+type TBotContext = {
+  client: Client;
+  guildId: string;
+  baseUrl: string;
 };
 
-type SharkordChannel = {
-  id: number;
-  name: string;
-  isDm?: boolean;
-};
+let bot: TBotContext | null = null;
+let lastError: string | undefined;
 
-type SharkordDataApi = {
-  getChannel(channelId: number): Promise<unknown | undefined>;
-  getChannels?: () => Promise<unknown[]>;
-};
+const webhookByChannelId = new Map<string, Webhook>();
+const sharkordChannelIdByName = new Map<string, number>();
 
 const normalizeChannelName = (name: string) => name.trim().toLowerCase();
 
-const isSharkordChannel = (value: unknown): value is SharkordChannel => {
-  if (!value || typeof value !== "object") {
-    return false;
+const buildAvatarUrl = (
+  ctx: PluginContext<TPlugin>,
+  file: SharkordAvatar | null | undefined,
+  baseUrl: string,
+) => {
+  if (!file || !baseUrl) {
+    return undefined;
   }
-
-  const candidate = value as Partial<SharkordChannel>;
-  return typeof candidate.id === "number" && typeof candidate.name === "string";
-};
-
-const indexChannels = (channels: unknown[]) => {
-  for (const channel of channels) {
-    if (!isSharkordChannel(channel) || channel.isDm) {
-      continue;
-    }
-
-    sharkordChannelIdByName.set(normalizeChannelName(channel.name), channel.id);
-  }
-};
-
-const scanSharkordChannelsByIdRange = async (ctx: PluginContext) => {
-  const dataApi = ctx.data as SharkordDataApi;
-
-  for (let start = 1; start <= CHANNEL_SCAN_MAX_ID; start += CHANNEL_SCAN_BATCH_SIZE) {
-    const ids = Array.from(
-      { length: Math.min(CHANNEL_SCAN_BATCH_SIZE, CHANNEL_SCAN_MAX_ID - start + 1) },
-      (_, index) => start + index,
-    );
-
-    const channels = await Promise.all(
-      ids.map((channelId) => dataApi.getChannel(channelId).catch(() => undefined)),
-    );
-
-    indexChannels(channels);
-  }
-};
-
-const ensureChannelNameIndex = async (ctx: PluginContext) => {
-  if (sharkordChannelIdByName.size > 0) {
-    return;
-  }
-
-  if (channelScanPromise) {
-    await channelScanPromise;
-    return;
-  }
-
-  channelScanPromise = (async () => {
-    const dataApi = ctx.data as SharkordDataApi;
-
-    if (typeof dataApi.getChannels === "function") {
-      const channels = await dataApi.getChannels().catch(() => []);
-      indexChannels(channels);
-      return;
-    }
-
-    await scanSharkordChannelsByIdRange(ctx);
-  })();
-
-  try {
-    await channelScanPromise;
-  } finally {
-    channelScanPromise = null;
-  }
-};
-
-const resolveSharkordChannelIdByName = async (
-  ctx: PluginContext,
-  channelName: string,
-): Promise<number | undefined> => {
-  const key = normalizeChannelName(channelName);
-  const cached = sharkordChannelIdByName.get(key);
-  if (cached !== undefined) {
-    return cached;
-  }
-
-  await ensureChannelNameIndex(ctx);
-  return sharkordChannelIdByName.get(key);
-};
-
-
-const buildAvatarUrl = (file: SharkordFile | null | undefined, baseUrl: string) => {
-  if (!file) return undefined;
 
   const url = new URL(`/public/${encodeURIComponent(file.name)}`, baseUrl);
 
@@ -135,31 +51,64 @@ const buildAvatarUrl = (file: SharkordFile | null | undefined, baseUrl: string) 
   return url.toString();
 };
 
+const refreshChannelIndex = async (ctx: PluginContext<TPlugin>) => {
+  const channels = await ctx.channels.list();
+
+  sharkordChannelIdByName.clear();
+
+  for (const channel of channels) {
+    if (channel.isDm || channel.type !== ChannelType.TEXT) {
+      continue;
+    }
+
+    sharkordChannelIdByName.set(
+      normalizeChannelName(channel.name),
+      channel.id,
+    );
+  }
+};
+
+const resolveSharkordChannelIdByName = async (
+  ctx: PluginContext<TPlugin>,
+  channelName: string,
+): Promise<number | undefined> => {
+  const key = normalizeChannelName(channelName);
+  const cached = sharkordChannelIdByName.get(key);
+
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  await refreshChannelIndex(ctx);
+
+  return sharkordChannelIdByName.get(key);
+};
 
 const getOrCreateWebhook = async (
-  ctx: PluginContext,
+  ctx: PluginContext<TPlugin>,
   guildId: string,
   channelName: string,
 ): Promise<Webhook | null> => {
-  if (!discordClient) {
+  if (!bot) {
     return null;
   }
 
   const guild =
-    discordClient.guilds.cache.get(guildId) ??
-    (await discordClient.guilds.fetch(guildId).catch(() => null));
+    bot.client.guilds.cache.get(guildId) ??
+    (await bot.client.guilds.fetch(guildId).catch(() => null));
 
   if (!guild) {
-    ctx.log(`Discord guild with ID ${guildId} was not found by the bot.`);
+    ctx.logger.error(`Discord guild with ID ${guildId} was not found by the bot.`);
     return null;
   }
 
   const channel = guild.channels.cache.find(
-    (ch) => ch.type === ChannelType.GuildText && ch.name === channelName,
+    (ch) =>
+      ch.type === DiscordChannelType.GuildText && ch.name === channelName,
   );
 
-  if (!channel || channel.type !== ChannelType.GuildText) {
-    ctx.log(
+  if (!channel || channel.type !== DiscordChannelType.GuildText) {
+    ctx.logger.error(
       `Discord text channel with name ${channelName} was not found in guild ${guildId}.`,
     );
     return null;
@@ -167,13 +116,14 @@ const getOrCreateWebhook = async (
 
   const textChannel = channel as TextChannel;
   const cachedWebhook = webhookByChannelId.get(textChannel.id);
+
   if (cachedWebhook) {
     return cachedWebhook;
   }
 
   const existingWebhooks = await textChannel.fetchWebhooks();
   const ownedWebhook = existingWebhooks.find(
-    (webhook) => webhook.owner?.id === discordClient?.user?.id,
+    (webhook) => webhook.owner?.id === bot?.client.user?.id,
   );
 
   const webhook =
@@ -184,50 +134,115 @@ const getOrCreateWebhook = async (
     }));
 
   webhookByChannelId.set(textChannel.id, webhook);
+
   return webhook;
 };
 
-const onLoad = async (ctx: PluginContext) => {
-  ctx.log("Starting Discord-Sharkord Bridge plugin...");
+const onLoad = async (ctx: PluginContext<TPlugin>) => {
+  ctx.logger.log("Starting Discord-Sharkord Bridge plugin...");
 
   const settings = await ctx.settings.register([
     {
       key: "discord-bot-token",
       name: "Discord Bot Token",
       description: "The token for your Discord bot",
-      type: "string",
-      defaultValue: "BotTokenGoesHere",
+      type: "secret",
+      defaultValue: "",
     },
     {
       key: "discord-guild-id",
       name: "Discord Guild ID",
       description: "The ID of the Discord guild where webhooks will be created",
       type: "string",
-      defaultValue: "ChangeThisToYourGuildID",
+      defaultValue: "",
     },
     {
       key: "sharkord-public-base-url",
       name: "Sharkord Public Base URL",
-      description: "The base URL for the Sharkord public fileserver, used to build avatar URLs. Only needed if you want to display user avatars in Discord",
+      description:
+        "The base URL for the Sharkord public fileserver, used to build avatar URLs. Only needed if you want to display user avatars in Discord",
       type: "string",
-      defaultValue: "https://your-sharkord-instance.com",
+      defaultValue: "",
     },
-  ]);
+  ] as const);
 
-  const botToken = await settings.get("discord-bot-token");
-  const guildId = await settings.get("discord-guild-id");
-  const sharkordBaseUrl = await settings.get("sharkord-public-base-url");
-  if (!botToken || botToken === "BotTokenGoesHere") {
-    ctx.log(
-      "Discord bot is disabled: configure a valid Discord Bot Token in plugin settings.",
-    );
-    return;
-  }
+  const botToken = String(settings.get("discord-bot-token") ?? "");
+  const guildId = String(settings.get("discord-guild-id") ?? "");
+  const baseUrl = String(settings.get("sharkord-public-base-url") ?? "");
 
-  if (!guildId || guildId === "ChangeThisToYourGuildID") {
-    ctx.log(
-      "Discord bridge is disabled: configure a valid Discord Guild ID in plugin settings.",
-    );
+  const buildStatus = (): TBridgeStatus => ({
+    configured: Boolean(botToken) && Boolean(guildId),
+    connected: bot?.client.isReady() ?? false,
+    guildId,
+    discordUsername: bot?.client.user?.tag ?? null,
+    bridgedChannels: [...sharkordChannelIdByName.keys()].sort(),
+    error: lastError,
+  });
+
+  ctx.ui.enable();
+
+  ctx.actions.register({
+    name: "getStatus",
+    description: "Returns the current state of the Discord bridge.",
+    executes: async () => buildStatus(),
+  });
+
+  
+  ctx.events.on("channel:created", () => refreshChannelIndex(ctx));
+  ctx.events.on("channel:updated", () => refreshChannelIndex(ctx));
+  ctx.events.on("channel:deleted", () => refreshChannelIndex(ctx));
+
+  // Sharkord -> Discord
+  ctx.events.on(
+    "message:created",
+    async ({ userId, channelId, textContent, pluginId }) => {
+
+      if (pluginId === ctx.pluginId) {
+        return;
+      }
+
+      if (!bot) {
+        lastError = "Discord bot client is not initialized.";
+        return;
+      }
+
+      const channel = await ctx.channels.get(channelId);
+
+      if (!channel || channel.isDm || channel.type !== ChannelType.TEXT) {
+        return;
+      }
+
+      const text = textContent.trim();
+
+      if (!text) {
+        return;
+      }
+
+      const user = userId !== null ? await ctx.users.get(userId) : undefined;
+      const username = user?.name ?? "unknown-user";
+
+      try {
+        const webhook = await getOrCreateWebhook(ctx, bot.guildId, channel.name);
+
+        if (!webhook) {
+          return;
+        }
+
+        await webhook.send({
+          content: text,
+          username,
+          avatarURL: buildAvatarUrl(ctx, user?.avatar, bot.baseUrl),
+        });
+      } catch (error) {
+        lastError = `Failed to create/send Discord webhook message: ${String(error)}`;
+        ctx.logger.error(lastError);
+      }
+    },
+  );
+
+  if (!botToken || !guildId) {
+    ctx.logger.log("Discord bridge is disabled: configure a valid Discord Bot Token and Guild ID in plugin settings.");
+    ctx.push.toAll(buildStatus());
     return;
   }
 
@@ -240,105 +255,86 @@ const onLoad = async (ctx: PluginContext) => {
     ],
   });
 
-  client.once("ready", () => {
-    ctx.log(`Discord bot connected as ${client.user?.tag ?? "unknown-user"}`);
+  bot = { client, guildId, baseUrl };
+
+  client.once("clientReady", () => {
+    lastError = undefined;
+    ctx.logger.log(`Discord bot connected as ${client.user?.tag ?? "unknown-user"}`);
+
+    void refreshChannelIndex(ctx).catch(() => undefined);
+    ctx.push.toAll(buildStatus());
   });
 
+  client.on("error", (error) => {
+    lastError = String(error);
+    ctx.logger.error(`Discord client error: ${lastError}`);
+  });
+
+  // Discord -> Sharkord
   client.on("messageCreate", async (message) => {
-    if (message.guildId !== guildId) return;
-    if (message.author.bot || message.webhookId) return;
-
-    const text = message.content?.trim();
-    if (!text) return;
-
-    const channelName =
-      message.channel.type === ChannelType.GuildText
-        ? message.channel.name
-        : undefined;
-        
-    if (!channelName) return;
-
-    const sharkordChannelId = await resolveSharkordChannelIdByName(ctx, channelName);
-    if (sharkordChannelId === undefined) {
-      ctx.error(
-        `Could not find Sharkord channel ID for Discord channel name '${channelName}'.`,
-      );
-      return;
-    }
-
-    await ctx.messages.send(
-      sharkordChannelId,
-      "[" + message.author.displayName + "] <br>" + text,
-    );
-  });
-
-  await client.login(botToken);
-  discordClient = client;
-  ctx.log("Discord bot client initialized");
-  
-  ctx.events.on("message:created", async ({ userId, channelId, textContent, pluginId }) => {
-    if (pluginId === ctx.pluginId) {
-      return;
-    }
-
-    if (!discordClient) {
-      ctx.error("Discord bot client is not initialized.");
-      return;
-    }
-
-
-    const sharkordChannel = await ctx.data.getChannel(channelId) as SharkordChannel | undefined;
-    const sharkordUser = await ctx.data.getUser(userId ?? -1) as SharkordUser | undefined;
-    const sharkordUsername = sharkordUser ? sharkordUser.name : "unknown-user";
-
-    if (sharkordChannel?.name) {
-      sharkordChannelIdByName.set(
-        normalizeChannelName(sharkordChannel.name),
-        sharkordChannel.id,
-      );
-    }
-
-
-    if (sharkordChannel?.isDm) {
-      return;
-    }
-
-    if (sharkordChannel?.name === undefined) {
-      ctx.error(`Channel with ID ${channelId} not found or has no name.`);
-      return;
-    }
-
-
     try {
-      const webhook = await getOrCreateWebhook(ctx, guildId, sharkordChannel?.name);
-      if (!webhook) {
+      if (message.guildId !== guildId) {
         return;
       }
 
-      const sharkordUserAvatar = buildAvatarUrl(sharkordUser?.avatar, sharkordBaseUrl);
+      if (message.author.bot || message.webhookId) {
+        return;
+      }
 
-      await webhook.send({
-        content: textContent,
-        username: `${sharkordUsername}`,
-        avatarURL: sharkordUserAvatar,
-      });
+      const text = message.content?.trim();
+
+      if (!text) {
+        return;
+      }
+
+      if (message.channel.type !== DiscordChannelType.GuildText) {
+        return;
+      }
+
+      const channelName = message.channel.name;
+      const sharkordChannelId = await resolveSharkordChannelIdByName(
+        ctx,
+        channelName,
+      );
+
+      if (sharkordChannelId === undefined) {
+        ctx.logger.error(`Could not find Sharkord channel ID for Discord channel name '${channelName}'.`,);
+        return;
+      }
+
+      await ctx.messages.send(
+        sharkordChannelId,
+        `[${message.author.displayName}] <br>${text}`,
+      );
     } catch (error) {
-      ctx.error(`Failed to create/send Discord webhook message: ${String(error)}`);
+      ctx.logger.error(`Failed to bridge Discord message: ${String(error)}`);
     }
-    
   });
+
+  try {
+    await client.login(botToken);
+
+    ctx.logger.log("Discord bot client initialized");
+  } catch (error) {
+    lastError = `Failed to log in to Discord: ${String(error)}`;
+    ctx.logger.error(lastError);
+    client.destroy();
+    bot = null;
+    ctx.push.toAll(buildStatus());
+  }
 };
 
-const onUnload = async (ctx: PluginContext) => {
+const onUnload = (ctx: UnloadPluginContext) => {
   webhookByChannelId.clear();
   sharkordChannelIdByName.clear();
+  lastError = undefined;
 
-  if (discordClient) {
-    discordClient.destroy();
-    discordClient = null;
+  if (bot) {
+    bot.client.destroy();
+    bot = null;
   }
 
-  ctx.log("My Plugin unloaded");
+  ctx.logger.log("Discord-Sharkord Bridge unloaded");
 };
 
 export { onLoad, onUnload };

@@ -5,17 +5,16 @@
   "type": "module",
   "scripts": {
     "build": "bun build.ts",
-    "publish": "bun publish.ts"
+    "publish": "bun publish.ts",
+    "setup": "bun scripts/setup.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",
     "@types/react": "^19.2.14"
   },
   "peerDependencies": {
-    "typescript": "^5",
     "react": "^19",
-    "reselect": "^5",
-    "re-reselect": "^5"
+    "typescript": "^5"
   },
   "dependencies": {
     "discord.js": "^14.26.3"
